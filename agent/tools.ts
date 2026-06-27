@@ -441,14 +441,10 @@ const SpendingTrackerSchema = z.object({
   medications: z.number(),
   bills: z.number(),
   serviceFees: z.number(),
-  transactions: z.array(z.object({
-    id: z.string(),
-    category: z.string(),
-    amount: z.number(),
-    createdAt: z.string(),
-    description: z.string().optional(),
-    metadata: z.record(z.any()).optional(),
-  })),
+  // Accept both the legacy Transaction shape (timestamp/type/recipient/status)
+  // and the upstream shape (createdAt/metadata). normalizeTransactionCategories
+  // casts entries to Transaction after loading, so loose validation is intentional.
+  transactions: z.array(z.record(z.unknown())),
 });
 
 type PaymentCategory =
@@ -544,7 +540,7 @@ function readSpendingFromDisk(recipientId?: string): SpendingTracker {
         throw new Error('Snapshot schema validation failed');
       }
 
-      const snapshot = validated.data as SpendingTracker & { _snapshotTxCount?: number };
+      const snapshot = validated.data as unknown as SpendingTracker & { _snapshotTxCount?: number };
       const snapshotTxCount = (parsed as any)._snapshotTxCount ?? snapshot.transactions.length;
 
       // Replay transactions from the JSONL tail that came after the snapshot
@@ -603,7 +599,7 @@ function readSpendingFromDisk(recipientId?: string): SpendingTracker {
       return createEmptySpendingTracker();
     }
 
-    const normalized = normalizeTransactionCategories(validated.data, recipientId);
+    const normalized = normalizeTransactionCategories(validated.data as unknown as SpendingTracker, recipientId);
     if (normalized.migrated) {
       saveSpending(normalized.data, recipientId);
     }
