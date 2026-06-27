@@ -28,7 +28,7 @@
 
 import 'dotenv/config';
 import { fileURLToPath } from 'url';
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, renameSync, promises as fsPromises } from 'fs';
 import { z } from 'zod';
 import { logger } from '../shared/logger.ts';
 import { resolveStellarNetwork, validateSignerKeyForNetwork } from '../shared/stellar-network.ts';
@@ -78,6 +78,7 @@ import {
   policyBlocksTotal,
   agentSpendingUsd,
   agentTransactionsTotal,
+  x402TxExtractionFailedTotal,
 } from '../shared/metrics.ts';
 import {
   assertMockNetworkAllowed,
@@ -86,6 +87,30 @@ import {
 } from '../shared/network-mode.ts';
 
 assertMockNetworkAllowed();
+
+// Atomic file write helpers (Issues #203, #204)
+function writeAtomically(filePath: string, content: string): void {
+  const tempPath = `${filePath}.tmp-${Date.now()}`;
+  try {
+    writeFileSync(tempPath, content, 'utf-8');
+    renameSync(tempPath, filePath);
+  } catch (err) {
+    try { writeFileSync(filePath.slice(0, filePath.lastIndexOf('/')), '', 'utf-8'); } catch {}
+    throw err;
+  }
+}
+
+function rotateCorruptedFile(filePath: string): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const rotatedPath = `${filePath}.corrupt-${timestamp}`;
+  try {
+    renameSync(filePath, rotatedPath);
+    logger.error({ filePath, rotatedPath }, '[Persistence] Rotated corrupted file');
+  } catch (err) {
+    logger.error({ filePath, err }, '[Persistence] Failed to rotate corrupted file');
+  }
+  return rotatedPath;
+}
 
 // Resolve Stellar network configuration
 const STELLAR_CONFIG = resolveStellarNetwork();
@@ -132,20 +157,40 @@ async function getRecommendedFee(): Promise<string> {
   }
 }
 
-// Helper: extract real Stellar tx hash from x402 PAYMENT-RESPONSE header
-export function extractX402TxHash(response: Response): string | undefined {
+export const TX_HASH_EXTRACTION_FAILED = 'extraction_failed' as const;
+
+// Helper: extract real Stellar tx hash from x402 PAYMENT-RESPONSE header.
+// Returns undefined when no header is present, TX_HASH_EXTRACTION_FAILED when
+// the header is present but all decode strategies fail (logged + counted), or
+// a 64-char hex hash on success. Callers must check for the sentinel before
+// passing the result to waitForStellarSettlement (#191).
+export function extractX402TxHash(
+  response: Response,
+): string | typeof TX_HASH_EXTRACTION_FAILED | undefined {
   const header =
     response.headers.get('PAYMENT-RESPONSE') ||
     response.headers.get('payment-response') ||
     response.headers.get('X-PAYMENT-RESPONSE');
   if (!header) return undefined;
+
+  // Strategy 1: decode the structured payment-response header
   try {
     const decoded = decodePaymentResponseHeader(header);
-    return decoded.transaction || undefined;
+    if (decoded.transaction) return decoded.transaction;
   } catch {
-    // If decode fails, the header itself might be a raw hash
-    return header.length === 64 ? header : undefined;
+    // fall through to strategy 2
   }
+
+  // Strategy 2: the header itself might be a raw 64-char hex hash
+  if (STELLAR_TX_HASH_RE.test(header)) return header;
+
+  // All strategies failed — log full header for debugging and count the event
+  logger.warn(
+    { paymentResponseHeader: header.slice(0, 500) },
+    '[x402] extractX402TxHash: all extraction strategies failed; hash unverifiable on-chain',
+  );
+  x402TxExtractionFailedTotal.inc();
+  return TX_HASH_EXTRACTION_FAILED;
 }
 
 // Helper: submitTransaction with timeout and retry
@@ -412,6 +457,20 @@ interface SpendingTracker {
   transactions: Transaction[];
 }
 
+const SpendingTrackerSchema = z.object({
+  medications: z.number(),
+  bills: z.number(),
+  serviceFees: z.number(),
+  transactions: z.array(z.object({
+    id: z.string(),
+    category: z.string(),
+    amount: z.number(),
+    createdAt: z.string(),
+    description: z.string().optional(),
+    metadata: z.record(z.any()).optional(),
+  })),
+});
+
 type PaymentCategory =
   | typeof TRANSACTION_CATEGORY.MEDICATIONS
   | typeof TRANSACTION_CATEGORY.BILLS;
@@ -488,8 +547,25 @@ function readSpendingFromDisk(recipientId?: string): SpendingTracker {
   // --- Try new snapshot + JSONL tail path first ---
   if (existsSync(snapshotFile)) {
     try {
-      const snapshot = JSON.parse(readFileSync(snapshotFile, 'utf-8')) as SpendingTracker & { _snapshotTxCount?: number };
-      const snapshotTxCount = snapshot._snapshotTxCount ?? snapshot.transactions.length;
+      const raw = readFileSync(snapshotFile, 'utf-8');
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseErr) {
+        logger.warn({ file: snapshotFile }, '[Persistence] JSON parse failed on snapshot');
+        rotateCorruptedFile(snapshotFile);
+        throw parseErr;
+      }
+
+      const validated = SpendingTrackerSchema.safeParse(parsed);
+      if (!validated.success) {
+        logger.warn({ file: snapshotFile, errors: validated.error.errors }, '[Persistence] Snapshot schema invalid');
+        rotateCorruptedFile(snapshotFile);
+        throw new Error('Snapshot schema validation failed');
+      }
+
+      const snapshot = validated.data as SpendingTracker & { _snapshotTxCount?: number };
+      const snapshotTxCount = (parsed as any)._snapshotTxCount ?? snapshot.transactions.length;
 
       // Replay transactions from the JSONL tail that came after the snapshot
       const tailTxs: Transaction[] = [];
@@ -528,16 +604,34 @@ function readSpendingFromDisk(recipientId?: string): SpendingTracker {
   // --- Legacy fallback: spending.json (full JSON blob) ---
   if (!existsSync(legacyFile)) return createEmptySpendingTracker();
   try {
-    const parsed = JSON.parse(readFileSync(legacyFile, 'utf-8')) as SpendingTracker;
-    const normalized = normalizeTransactionCategories(parsed, recipientId);
+    const raw = readFileSync(legacyFile, 'utf-8');
+    let parsed: any;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (parseErr) {
+      logger.error({ file: legacyFile }, '[Persistence] JSON parse failed on spending.json');
+      const rotated = rotateCorruptedFile(legacyFile);
+      logger.error({ rotatedPath: rotated }, '[Persistence] CRITICAL: Corrupted spending file rotated, starting fresh');
+      return createEmptySpendingTracker();
+    }
+
+    const validated = SpendingTrackerSchema.safeParse(parsed);
+    if (!validated.success) {
+      logger.error({ file: legacyFile, errors: validated.error.errors }, '[Persistence] spending.json schema invalid');
+      const rotated = rotateCorruptedFile(legacyFile);
+      logger.error({ rotatedPath: rotated }, '[Persistence] CRITICAL: Invalid spending schema, starting fresh');
+      return createEmptySpendingTracker();
+    }
+
+    const normalized = normalizeTransactionCategories(validated.data, recipientId);
     if (normalized.migrated) {
       saveSpending(normalized.data, recipientId);
     }
     return normalized.data;
   } catch (err: any) {
-    logger.warn(
+    logger.error(
       { file: legacyFile, error: err.message },
-      '[Persistence] spending.json is corrupted; falling back to an empty tracker',
+      '[Persistence] CRITICAL: Unexpected error loading spending.json',
     );
     return createEmptySpendingTracker();
   }
@@ -579,15 +673,13 @@ export function appendTransaction(tx: Transaction, recipientId?: string): void {
  */
 export function compactSnapshot(data: SpendingTracker, recipientId?: string): void {
   const snapshotFile = getSnapshotFile(recipientId);
-  const tempFile = `${snapshotFile}.tmp-${Date.now()}`;
   const payload = {
     ...data,
     // Record how many JSONL lines this snapshot covers so the read path
     // knows where the tail starts.
     _snapshotTxCount: data.transactions.length,
   };
-  writeFileSync(tempFile, JSON.stringify(payload, null, 2), 'utf-8');
-  renameSync(tempFile, snapshotFile);
+  writeAtomically(snapshotFile, JSON.stringify(payload, null, 2));
   logger.info(
     { txCount: data.transactions.length, recipientId: recipientId || currentRecipientId },
     '[Persistence] Compacted spending snapshot',
@@ -601,9 +693,7 @@ export function compactSnapshot(data: SpendingTracker, recipientId?: string): vo
 export function saveSpending(data: SpendingTracker, recipientId?: string) {
   // 1. Legacy full-file (backward compat for external tooling)
   const file = getSpendingFile(recipientId);
-  const tempFile = `${file}.tmp-${Date.now()}`;
-  writeFileSync(tempFile, JSON.stringify(data, null, 2));
-  renameSync(tempFile, file);
+  writeAtomically(file, JSON.stringify(data, null, 2));
 
   // 2. Write / refresh the snapshot file so the new read path can find state
   compactSnapshot(data, recipientId);
@@ -671,6 +761,7 @@ function recordServiceFee(
   description: string,
   recipient: string,
   stellarTxHash?: string,
+  txHashStatus?: 'extracted' | 'extraction_failed',
 ) {
   x402SettlementsTotal.inc();
   spendingTracker.serviceFees += amount;
@@ -682,6 +773,7 @@ function recordServiceFee(
     amount,
     recipient,
     stellarTxHash,
+    txHashStatus,
     status: 'completed',
     category: TRANSACTION_CATEGORY.SERVICE_FEES,
   };
@@ -887,7 +979,11 @@ export async function comparePharmacyPrices(
   const data = await response.json();
 
   // Extract real Stellar tx hash from x402 payment response header
-  const txHash = extractX402TxHash(response);
+  const txHashResult = extractX402TxHash(response);
+  const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
+  const txHashStatus = txHashResult === TX_HASH_EXTRACTION_FAILED
+    ? 'extraction_failed' as const
+    : txHash ? 'extracted' as const : undefined;
 
   // Wait for on-chain settlement before recording the fee
   if (txHash) {
@@ -904,6 +1000,7 @@ export async function comparePharmacyPrices(
     `x402 query: pharmacy prices for ${drugName}`,
     data.protocol?.payTo || 'pharmacy-price-api',
     txHash,
+    txHashStatus,
   );
 
   return data;
@@ -1081,7 +1178,11 @@ export async function auditBill(
 
   const data = await response.json();
 
-  const txHash = extractX402TxHash(response);
+  const txHashResult = extractX402TxHash(response);
+  const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
+  const txHashStatus = txHashResult === TX_HASH_EXTRACTION_FAILED
+    ? 'extraction_failed' as const
+    : txHash ? 'extracted' as const : undefined;
 
   // Wait for on-chain settlement before recording the fee
   if (txHash) {
@@ -1098,6 +1199,7 @@ export async function auditBill(
     'x402 query: medical bill audit',
     data.protocol?.payTo || 'bill-audit-api',
     txHash,
+    txHashStatus,
   );
 
   return data;
@@ -1160,7 +1262,11 @@ export async function checkDrugInteractions(medications: string[]) {
 
   const data = await response.json();
 
-  const txHash = extractX402TxHash(response);
+  const txHashResult = extractX402TxHash(response);
+  const txHash = txHashResult === TX_HASH_EXTRACTION_FAILED ? undefined : txHashResult;
+  const txHashStatus = txHashResult === TX_HASH_EXTRACTION_FAILED
+    ? 'extraction_failed' as const
+    : txHash ? 'extracted' as const : undefined;
 
   // Wait for on-chain settlement before recording the fee
   if (txHash) {
@@ -1177,6 +1283,7 @@ export async function checkDrugInteractions(medications: string[]) {
     `x402 query: drug interactions for ${medications.join(', ')}`,
     data.protocol?.payTo || 'drug-interaction-api',
     txHash,
+    txHashStatus,
   );
 
   return data;
@@ -1922,7 +2029,7 @@ function loadOrders(recipientId?: string): OrderRecord[] {
   return JSON.parse(readFileSync(file, "utf-8"));
 }
 function saveOrders(orders: OrderRecord[], recipientId?: string) {
-  writeFileSync(getOrdersFile(recipientId), JSON.stringify(orders, null, 2));
+  writeAtomically(getOrdersFile(recipientId), JSON.stringify(orders, null, 2));
 }
 
 // --- Tool: Schedule an adherence reminder after pharmacy order (Issue #264) ---
