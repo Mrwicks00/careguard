@@ -18,5 +18,5 @@ import fs from 'fs';
 
 // Run before each test file
 const workerId = process.env.VITEST_WORKER_ID || Math.random().toString(36).slice(2);
-process.env.DATA_DIR = path.join(__dirname, \`data-test-env-\${workerId}\`);
+process.env.DATA_DIR = path.join(__dirname, `data-test-env-${workerId}`);
 
