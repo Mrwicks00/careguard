@@ -1501,9 +1501,24 @@ export async function payForMedication(
       ? 'daily_limit'
       : 'budget';
     policyBlocksTotal.inc({ reason });
+    
+    const tx = {
+      id: `tx-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      type: 'medication',
+      description: `${drugName} from ${pharmacyName}`,
+      amount,
+      recipient: pharmacyId,
+      status: 'blocked',
+      category: TRANSACTION_CATEGORY.MEDICATIONS,
+    };
+    spendingTracker.transactions.push(tx);
+    appendTransaction(tx as any);
+
     return {
       success: false,
       error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
+      transaction: tx,
     };
   }
   if (policyCheck.requiresApproval && !skipApproval) {
@@ -1613,9 +1628,24 @@ export async function payBill(
       ? 'daily_limit'
       : 'budget';
     policyBlocksTotal.inc({ reason });
+    
+    const tx = {
+      id: `tx-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      type: 'bill',
+      description: `${description} — ${providerName}`,
+      amount,
+      recipient: providerId,
+      status: 'blocked',
+      category: TRANSACTION_CATEGORY.BILLS,
+    };
+    spendingTracker.transactions.push(tx);
+    appendTransaction(tx as any);
+
     return {
       success: false,
       error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
+      transaction: tx,
     };
   }
   if (policyCheck.requiresApproval && !skipApproval) {
