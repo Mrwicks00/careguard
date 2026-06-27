@@ -320,7 +320,9 @@ export function getMppClient(): MppClientInstance {
 }
 
 // --- Per-recipient data directories (Issue #261) ---
-const DATA_DIR = new URL('../data', import.meta.url).pathname;
+export function getDataDir(): string {
+  return process.env.DATA_DIR || new URL('../data', import.meta.url).pathname;
+}
 
 let currentRecipientId = 'rosa';
 
@@ -361,7 +363,7 @@ export function setCurrentRecipient(recipientId: string) {
 export function getCurrentRecipient() { return currentRecipientId; }
 
 function getRecipientDir(recipientId: string): string {
-  return `${DATA_DIR}/recipients/${recipientId}`;
+  return `${getDataDir()}/recipients/${recipientId}`;
 }
 function getSpendingFile(recipientId?: string): string {
   return `${getRecipientDir(recipientId || currentRecipientId)}/spending.json`;
@@ -383,8 +385,8 @@ function getOrdersFile(recipientId?: string): string {
 
 // Migrate legacy flat files to per-recipient structure (one-time)
 function migrateLegacyData() {
-  const legacySpending = `${DATA_DIR}/spending.json`;
-  const legacyOrders = `${DATA_DIR}/orders.json`;
+  const legacySpending = `${getDataDir()}/spending.json`;
+  const legacyOrders = `${getDataDir()}/orders.json`;
   const rosaDir = getRecipientDir('rosa');
   if (!existsSync(rosaDir)) mkdirSync(rosaDir, { recursive: true });
   if (existsSync(legacySpending) && !existsSync(`${rosaDir}/spending.json`)) {
@@ -401,7 +403,7 @@ function migrateLegacyData() {
 }
 migrateLegacyData();
 
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+if (!existsSync(getDataDir())) mkdirSync(getDataDir(), { recursive: true });
 if (!existsSync(getRecipientDir(currentRecipientId))) mkdirSync(getRecipientDir(currentRecipientId), { recursive: true });
 
 interface SpendingTracker {
@@ -1098,7 +1100,9 @@ export async function checkDrugInteractions(medications: string[]) {
   }
 
   const response = await x402Fetch(
-    `${DRUG_INTERACTION_API}/drug/interactions?meds=${encodeURIComponent(medsParam)}`,
+    `${DRUG_INTERACTION_API}/drug/interactions?meds=${encodeURIComponent(
+      medications.join(','),
+    )}`,
   );
 
   if (!response.ok) {
@@ -1879,7 +1883,7 @@ function saveOrders(orders: OrderRecord[], recipientId?: string) {
 }
 
 // --- Tool: Schedule an adherence reminder after pharmacy order (Issue #264) ---
-const ADHERENCE_FILE = `${DATA_DIR}/adherence.jsonl`;
+const ADHERENCE_FILE = `${getDataDir()}/adherence.jsonl`;
 interface AdherenceEntry {
   recipientId: string;
   reminderDate: string;
