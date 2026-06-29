@@ -76,10 +76,13 @@ import {
   paymentsUsdcTotal,
   stellarTxSubmittedTotal,
   policyBlocksTotal,
+  paymentRejectedTotal,
   agentSpendingUsd,
   agentTransactionsTotal,
   x402TxExtractionFailedTotal,
+  stellarFeeBumpsTotal,
 } from '../shared/metrics.ts';
+import { getTargetFee } from '../shared/stellar-fee.ts';
 import {
   assertMockNetworkAllowed,
   createMockReceipt,
@@ -153,19 +156,9 @@ validateSignerKeyForNetwork(AGENT_SECRET_KEY, STELLAR_CONFIG);
 
 const horizonServer = new Horizon.Server(HORIZON_URL);
 
-// Helper: calculate recommended fee based on network conditions
+// Helper: calculate recommended fee based on network conditions (p90 from Horizon fee_stats)
 async function getRecommendedFee(): Promise<string> {
-  try {
-    const feeStats = await horizonServer.feeStats();
-    const recommendedFee = parseInt(feeStats.fee_charged.mode, 10);
-    // Use 1.5x the recommended fee to ensure acceptance during congestion
-    const adjustedFee = Math.max(MIN_FEE_STROOPS, Math.ceil(recommendedFee * 1.5));
-    const cappedFee = Math.min(adjustedFee, MAX_FEE_STROOPS);
-    return cappedFee.toString();
-  } catch (err) {
-    logger.warn({ err: (err as Error).message }, '[Stellar] Failed to fetch fee stats, using minimum fee');
-    return MIN_FEE_STROOPS.toString();
-  }
+  return getTargetFee(horizonServer);
 }
 
 export const TX_HASH_EXTRACTION_FAILED = 'extraction_failed' as const;
@@ -241,7 +234,8 @@ async function submitTransactionWithRetry(
   throw lastError;
 }
 
-// Helper: submit transaction with automatic fee bump on insufficient_fee error
+// Helper: submit transaction with automatic fee bump on insufficient_fee error.
+// Wraps retries in fee-bump envelopes, doubling the fee each time (up to 3x max).
 async function submitTransactionWithFeeBump(
   server: Horizon.Server,
   account: any,
@@ -251,7 +245,7 @@ async function submitTransactionWithFeeBump(
 ): Promise<{ hash: string; fee: string }> {
   let currentFee = initialFee || await getRecommendedFee();
   let attempt = 0;
-  const maxAttempts = 2;
+  const maxAttempts = 3; // up to 3 fee bumps
 
   while (attempt < maxAttempts) {
     try {
@@ -274,15 +268,38 @@ async function submitTransactionWithFeeBump(
       const isFeeError = resultCodes?.transaction === 'tx_insufficient_fee';
 
       if (isFeeError && attempt < maxAttempts - 1) {
-        // Double the fee and retry
+        // Double the fee and wrap in a fee-bump envelope
         const newFee = Math.min(parseInt(currentFee) * 2, MAX_FEE_STROOPS);
         logger.warn(
           { oldFee: currentFee, newFee, attempt: attempt + 1 },
-          '[Stellar] Insufficient fee, retrying with higher fee',
+          '[Stellar] Insufficient fee, wrapping in fee-bump envelope',
         );
         currentFee = newFee.toString();
+        stellarFeeBumpsTotal.inc();
         attempt++;
-        continue;
+
+        // Build the inner transaction with the new fee
+        const innerTx = new TransactionBuilder(account, {
+          fee: currentFee,
+          networkPassphrase: STELLAR_NETWORK_PASSPHRASE,
+        });
+        for (const op of operations) {
+          innerTx.addOperation(op);
+        }
+        const builtInner = innerTx.setTimeout(30).build();
+        builtInner.sign(signer);
+
+        // Wrap in fee-bump envelope: feeSource is the agent wallet itself
+        const feeBumpTx = TransactionBuilder.buildFeeBumpTransaction(
+          signer,
+          currentFee,
+          builtInner,
+          STELLAR_NETWORK_PASSPHRASE,
+        );
+        feeBumpTx.sign(signer);
+
+        const result = await submitTransactionWithRetry(server, feeBumpTx as any);
+        return { hash: result.hash, fee: currentFee };
       }
 
       throw err;
@@ -488,6 +505,15 @@ interface SpendingTracker {
   bills: number;
   serviceFees: number;
   transactions: Transaction[];
+  /** Persisted month-to-date totals keyed by yearMonth (e.g. "2026-04").
+   *  On month boundary crossing, running totals are rotated so budget
+   *  enforcement always sees the current month's spend (Issue #208). */
+  monthTotals?: {
+    yearMonth: string;
+    medications: number;
+    bills: number;
+    serviceFees: number;
+  };
 }
 
 const SpendingTrackerSchema = z.object({
@@ -498,6 +524,12 @@ const SpendingTrackerSchema = z.object({
   // and the upstream shape (createdAt/metadata). normalizeTransactionCategories
   // casts entries to Transaction after loading, so loose validation is intentional.
   transactions: z.array(z.record(z.unknown())),
+  monthTotals: z.object({
+    yearMonth: z.string(),
+    medications: z.number(),
+    bills: z.number(),
+    serviceFees: z.number(),
+  }).optional(),
 });
 
 type PaymentCategory =
@@ -546,7 +578,41 @@ type SpendingCacheEntry = {
 const spendingCache = new Map<string, SpendingCacheEntry>();
 
 function createEmptySpendingTracker(): SpendingTracker {
-  return { medications: 0, bills: 0, serviceFees: 0, transactions: [] };
+  return {
+    medications: 0,
+    bills: 0,
+    serviceFees: 0,
+    transactions: [],
+    monthTotals: {
+      yearMonth: getCurrentYearMonth(),
+      medications: 0,
+      bills: 0,
+      serviceFees: 0,
+    },
+  };
+}
+
+function getCurrentYearMonth(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function rotateMonthIfNeeded(tracker: SpendingTracker): boolean {
+  const current = getCurrentYearMonth();
+  const stored = tracker.monthTotals?.yearMonth;
+  if (stored === current) return false;
+  // Month boundary crossed — rotate running totals
+  tracker.monthTotals = {
+    yearMonth: current,
+    medications: 0,
+    bills: 0,
+    serviceFees: 0,
+  };
+  tracker.medications = 0;
+  tracker.bills = 0;
+  tracker.serviceFees = 0;
+  logger.info({ from: stored, to: current }, '[Budget] Month boundary rotated spending totals');
+  return true;
 }
 
 function normalizeTransactionCategories(
@@ -828,6 +894,7 @@ function recordServiceFee(
   stellarTxHash?: string,
   txHashStatus?: 'extracted' | 'extraction_failed',
 ) {
+  rotateMonthIfNeeded(spendingTracker);
   x402SettlementsTotal.inc();
   spendingTracker.serviceFees += amount;
   const tx: Transaction = {
@@ -1421,28 +1488,9 @@ export function checkSpendingPolicy(
     spendingTracker.serviceFees;
   const globalRemaining = roundBudget(policy.monthlyLimit - totalMonthlySpending);
 
-  if (amount > globalRemaining) {
-    return {
-      allowed: false,
-      reason: `Payment of $${amount.toFixed(2)} would exceed overall monthly limit. Monthly limit: $${policy.monthlyLimit}, spent: $${totalMonthlySpending.toFixed(2)}, remaining: $${globalRemaining.toFixed(2)}`,
-      requiresApproval: false,
-      currentSpending,
-      budgetRemaining: remaining,
-      globalBudgetRemaining: globalRemaining,
-    };
-  }
-
-  if (amount > remaining) {
-    return {
-      allowed: false,
-      reason: `Payment of $${amount.toFixed(2)} exceeds ${category} monthly budget. Budget: $${budget}, spent: $${currentSpending.toFixed(2)}, remaining: $${remaining.toFixed(2)}`,
-      requiresApproval: false,
-      currentSpending,
-      budgetRemaining: remaining,
-    };
-  }
-
-  // Use the policy's per-recipient timezone if set; fall back to the global
+  // Compute today's spend in this category up-front so every return path can
+  // report the remaining daily budget to the caller (Issue #160). Use the
+  // policy's per-recipient timezone if set; fall back to the global
   // SPENDING_TIMEZONE env var so caregivers in non-UTC locales see the correct
   // "today" boundary for their wall clock (Issue #207).
   const effectiveTz = policy.timezone ?? SPENDING_TIMEZONE;
@@ -1462,6 +1510,34 @@ export function checkSpendingPolicy(
       },
     )
     .reduce((sum, t) => sum + t.amount, 0);
+  const dailyRemaining = roundBudget(policy.dailyLimit - totalToday);
+  // monthlyRemaining is the budget still available for this category this month.
+  const monthlyRemaining = remaining;
+
+  if (amount > globalRemaining) {
+    return {
+      allowed: false,
+      reason: `Payment of $${amount.toFixed(2)} would exceed overall monthly limit. Monthly limit: $${policy.monthlyLimit}, spent: $${totalMonthlySpending.toFixed(2)}, remaining: $${globalRemaining.toFixed(2)}`,
+      requiresApproval: false,
+      currentSpending,
+      budgetRemaining: remaining,
+      globalBudgetRemaining: globalRemaining,
+      dailyRemaining,
+      monthlyRemaining,
+    };
+  }
+
+  if (amount > remaining) {
+    return {
+      allowed: false,
+      reason: `Payment of $${amount.toFixed(2)} exceeds ${category} monthly budget. Budget: $${budget}, spent: $${currentSpending.toFixed(2)}, remaining: $${remaining.toFixed(2)}`,
+      requiresApproval: false,
+      currentSpending,
+      budgetRemaining: remaining,
+      dailyRemaining,
+      monthlyRemaining,
+    };
+  }
 
   if (totalToday + amount > policy.dailyLimit) {
     return {
@@ -1470,6 +1546,8 @@ export function checkSpendingPolicy(
       requiresApproval: false,
       currentSpending,
       budgetRemaining: remaining,
+      dailyRemaining,
+      monthlyRemaining,
     };
   }
 
@@ -1478,6 +1556,8 @@ export function checkSpendingPolicy(
     requiresApproval: amount >= policy.approvalThreshold,
     currentSpending,
     budgetRemaining: roundBudget(remaining - amount),
+    dailyRemaining,
+    monthlyRemaining,
   };
 }
 
@@ -1691,6 +1771,7 @@ export async function approvePendingTransaction(txId: string): Promise<any> {
   tx.stellarTxHash = result.stellarTxHash;
   if (result.mppOrderId) tx.mppOrderId = result.mppOrderId;
 
+  rotateMonthIfNeeded(spendingTracker);
   if (tx.category === TRANSACTION_CATEGORY.MEDICATIONS) {
     spendingTracker.medications += tx.amount;
     agentSpendingUsd.set(
@@ -1769,6 +1850,7 @@ export async function payForMedication(
   const release = await getBudgetMutex(currentRecipientId).acquire();
   let policyCheck: ReturnType<typeof checkSpendingPolicy>;
   try {
+    rotateMonthIfNeeded(spendingTracker);
     policyCheck = checkSpendingPolicy(
       amount,
       TRANSACTION_CATEGORY.MEDICATIONS,
@@ -1776,9 +1858,12 @@ export async function payForMedication(
     if (!policyCheck.allowed) {
       const reason = policyCheck.reason!.includes('daily')
         ? 'daily_limit'
-        : 'budget';
+        : policyCheck.reason!.includes('overall monthly limit')
+          ? 'monthly_limit'
+          : 'budget';
       policyBlocksTotal.inc({ reason });
-      
+      paymentRejectedTotal.inc({ reason });
+
       const tx = {
         id: `tx-${Date.now()}`,
         timestamp: new Date().toISOString(),
@@ -1792,10 +1877,26 @@ export async function payForMedication(
       spendingTracker.transactions.push(tx);
       appendTransaction(tx as any);
 
+      // Surface the full budget context so the LLM can decide whether to ask
+      // the caregiver for an override or pick a cheaper option (Issue #160).
+      const dailyRemaining = policyCheck.dailyRemaining ?? 0;
+      const monthlyRemaining = policyCheck.monthlyRemaining ?? 0;
+      const budgetContext = {
+        reason,
+        attempted: amount,
+        dailyRemaining,
+        monthlyRemaining,
+        suggestion:
+          `Relay this to the caregiver: the $${amount.toFixed(2)} payment was blocked by the spending policy. ` +
+          `Remaining budget is $${dailyRemaining.toFixed(2)} today and $${monthlyRemaining.toFixed(2)} this month for ${TRANSACTION_CATEGORY.MEDICATIONS}. ` +
+          `Ask them to approve a one-time override, or choose a cheaper option that fits the remaining budget.`,
+      };
+
       return {
         success: false,
         error: `BLOCKED BY SPENDING POLICY: ${policyCheck.reason}`,
         transaction: tx,
+        budgetContext,
       };
     }
     if (policyCheck.requiresApproval && !skipApproval) {
@@ -1918,6 +2019,7 @@ export async function payBill(
   const releaseBill = await getBudgetMutex(currentRecipientId).acquire();
   let billPolicyCheck: ReturnType<typeof checkSpendingPolicy>;
   try {
+    rotateMonthIfNeeded(spendingTracker);
     billPolicyCheck = checkSpendingPolicy(amount, TRANSACTION_CATEGORY.BILLS);
     if (!billPolicyCheck.allowed) {
       const reason = billPolicyCheck.reason!.includes('daily')
@@ -1994,39 +2096,21 @@ export async function payBill(
   let stellarTxHash: string | undefined;
 
   try {
-    const buildStellarTx = async () => {
-      const account = await horizonServer.loadAccount(agentKeypair.publicKey());
-      const usdcAsset = new Asset("USDC", USDC_ISSUER);
+    const account = await horizonServer.loadAccount(agentKeypair.publicKey());
+    const usdcAsset = new Asset("USDC", USDC_ISSUER);
 
-      const stellarTx = new TransactionBuilder(account, {
-        fee: "100",
-        networkPassphrase: Networks.TESTNET,
-      })
-        .addOperation(
-          Operation.payment({
-            destination: recipientKey,
-            asset: usdcAsset,
-            amount: amount.toFixed(7),
-          })
-        )
-        .setTimeout(STELLAR_TIMEBOUNDS_SECONDS)
-        .build();
+    const paymentOp = Operation.payment({
+      destination: recipientKey,
+      asset: usdcAsset,
+      amount: amount.toFixed(7),
+    });
 
-      stellarTx.sign(agentKeypair);
-
-      const sigHint = stellarTx.signatures[0]?.hint();
-      if (!sigHint || !sigHint.equals(agentKeypair.signatureHint())) {
-        throw new Error(
-          `Signer mismatch: expected ${agentKeypair.publicKey()} — refusing to submit`
-        );
-      }
-      return stellarTx;
-    };
-
-    let stellarTx = await buildStellarTx();
-    console.log(`  [Stellar] Signer verified: ${agentKeypair.publicKey().slice(0, 8)}...`);
-
-    const result = await submitTransactionWithRetry(horizonServer, stellarTx, 2, 35000, buildStellarTx);
+    const result = await submitTransactionWithFeeBump(
+      horizonServer,
+      account,
+      [paymentOp],
+      agentKeypair,
+    );
 
     stellarTxHash = result.hash;
     logger.info({ txHash: stellarTxHash, fee: result.fee }, '[Stellar] TX confirmed');
@@ -2369,7 +2453,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'compare_pharmacy_prices',
     description:
-      'Compare medication prices across multiple pharmacies. Pays $0.002 USDC per query via x402 on Stellar. Pass the medication dosage exactly as known; the returned dosage field is reliable and echoed from the request for safety. Returns prices sorted cheapest to most expensive, with potential savings. Each pharmacy has an inStock field: "unknown" means real-time inventory is unavailable (proceed with caution), true means in stock. Never assume a medication is in stock if inStock is "unknown" — confirm with the pharmacy before ordering.',
+      'Compare medication prices across multiple pharmacies. Pays $0.002 USDC per query via x402 on Stellar. Pass the medication dosage exactly as known; the returned dosage field is reliable and echoed from the request for safety. Returns prices sorted cheapest to most expensive, with potential savings. If the medication is unknown or no prices are found, the tool returns { ok: false, reason: "NO_PRICES_FOUND" } which you should handle gracefully (e.g. notify the caregiver). Each pharmacy has an inStock field: "unknown" means real-time inventory is unavailable (proceed with caution), true means in stock. Never assume a medication is in stock if inStock is "unknown" — confirm with the pharmacy before ordering.',
     input_schema: strictInputSchema({
       type: 'object' as const,
       properties: {
@@ -2431,7 +2515,7 @@ export const TOOL_DEFINITIONS = [
   {
     name: 'pay_for_medication',
     description:
-      'Pay a pharmacy for a medication order via MPP Charge on Stellar (real USDC payment). Subject to spending policy limits. Amount must be between $0.01 and $10,000.',
+      'Pay a pharmacy for a medication order via MPP Charge on Stellar (real USDC payment). Subject to spending policy limits. Amount must be between $0.01 and $10,000. If the payment is blocked by spending policy, the result includes a budgetContext object { reason, attempted, dailyRemaining, monthlyRemaining, suggestion }: relay it to the caregiver so they can either approve a one-time override or pick a cheaper option within the remaining budget.',
     input_schema: strictInputSchema({
       type: 'object' as const,
       properties: {
